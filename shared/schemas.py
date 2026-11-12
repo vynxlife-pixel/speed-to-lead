@@ -1,98 +1,106 @@
-"""Central configuration, read once from environment variables (or a local .env file)."""
+"""Pydantic models and constants shared by the backend and the dashboard."""
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass, field
-from functools import lru_cache
+from enum import Enum
+from typing import Any
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# Values copied straight from .env.example placeholders are treated as "not set".
-_PLACEHOLDER_PREFIXES = ("your_", "your-", "paste_", "changeme", "xxx")
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
-def _env(name: str, default: str = "") -> str:
-    value = (os.getenv(name) or default).strip()
-    if value.lower().startswith(_PLACEHOLDER_PREFIXES):
-        return ""
-    return value
+class Intent(str, Enum):
+    BUYER = "Buyer"
+    SELLER = "Seller"
+    RENTER = "Renter"
+    INVESTOR = "Investor"
 
 
-def _int_env(name: str, default: int) -> int:
-    try:
-        return int(_env(name, str(default)))
-    except ValueError:
-        return default
+LEAD_STATUSES = ["New", "Contacted", "Closed"]
+INTENTS = [i.value for i in Intent]
+
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "agency_name": "Skyline Realty Group",
+    "agent_name": "The Skyline Team",
+    "agent_email": "",
+    "agency_phone": "",
+    "agency_website": "",
+    "brand_color": "#1F4E79",
+    "currency": "USD",
+    "target_locations": "Downtown, Riverside, Westfield",
+    "min_budget": 250000,
+    "hot_lead_threshold": 8,
+    "email_signoff": "Warm regards,\nThe Skyline Realty Team",
+    "custom_instructions": (
+        "Be warm, professional and concise. Never quote prices or promise availability. "
+        "Invite the lead to reply with a good time for a call."
+    ),
+}
 
 
-@dataclass(frozen=True)
-class Config:
-    environment: str = "development"
-    log_level: str = "INFO"
+class LeadIn(BaseModel):
+    """Payload accepted by POST /webhook/new-lead."""
 
-    # AI
-    gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    model_config = ConfigDict(str_strip_whitespace=True, extra="ignore")
 
-    # Database
-    supabase_url: str = ""
-    supabase_service_key: str = ""
+    full_name: str = Field(min_length=1, max_length=120)
+    email: EmailStr
+    phone: str = Field(default="", max_length=40)
+    property_interest: str = Field(default="", max_length=300)
+    inquiry_message: str = Field(default="", max_length=4000)
+    source: str = Field(default="webhook", max_length=60)
 
-    # Webhook security
-    webhook_api_key: str = ""
-    rate_limit_per_minute: int = 60
-    allowed_origins: list[str] = field(default_factory=list)
-
-    # Email (Resend)
-    resend_api_key: str = ""
-    email_from: str = "Speed-to-Lead <onboarding@resend.dev>"
-
-    # Agent alerts
-    slack_webhook_url: str = ""
-    twilio_account_sid: str = ""
-    twilio_auth_token: str = ""
-    twilio_from_number: str = ""
-    agent_alert_phone: str = ""
-
-    # Dashboard
-    backend_url: str = "http://localhost:8000"
-    dashboard_password: str = ""
-    display_timezone: str = "UTC"
-
-    @property
-    def is_production(self) -> bool:
-        return self.environment.lower() == "production"
-
-    @property
-    def twilio_enabled(self) -> bool:
-        return all(
-            [self.twilio_account_sid, self.twilio_auth_token, self.twilio_from_number, self.agent_alert_phone]
-        )
+    @field_validator("phone", "property_interest", "inquiry_message", "source", mode="before")
+    @classmethod
+    def _none_to_empty(cls, v: Any) -> Any:
+        return "" if v is None else v
 
 
-@lru_cache(maxsize=1)
-def get_config() -> Config:
-    origins = [o.strip() for o in _env("ALLOWED_ORIGINS").split(",") if o.strip()]
-    return Config(
-        environment=_env("ENVIRONMENT", "development"),
-        log_level=_env("LOG_LEVEL", "INFO").upper(),
-        gemini_api_key=_env("GEMINI_API_KEY"),
-        gemini_model=_env("GEMINI_MODEL", "gemini-2.5-flash"),
-        supabase_url=_env("SUPABASE_URL"),
-        supabase_service_key=_env("SUPABASE_SERVICE_KEY"),
-        webhook_api_key=_env("WEBHOOK_API_KEY"),
-        rate_limit_per_minute=_int_env("RATE_LIMIT_PER_MINUTE", 60),
-        allowed_origins=origins,
-        resend_api_key=_env("RESEND_API_KEY"),
-        email_from=_env("EMAIL_FROM", "Speed-to-Lead <onboarding@resend.dev>"),
-        slack_webhook_url=_env("SLACK_WEBHOOK_URL"),
-        twilio_account_sid=_env("TWILIO_ACCOUNT_SID"),
-        twilio_auth_token=_env("TWILIO_AUTH_TOKEN"),
-        twilio_from_number=_env("TWILIO_FROM_NUMBER"),
-        agent_alert_phone=_env("AGENT_ALERT_PHONE"),
-        backend_url=_env("BACKEND_URL", "http://localhost:8000").rstrip("/"),
-        dashboard_password=_env("DASHBOARD_PASSWORD"),
-        display_timezone=_env("DISPLAY_TIMEZONE", "UTC"),
+class LeadAnalysis(BaseModel):
+    """Structured output requested from Gemini. Validators make it tolerant of small model slips."""
+
+    intent: Intent = Field(description="One of Buyer, Seller, Renter, Investor.")
+    budget_estimate: str = Field(
+        description="Budget as a short human-readable string, e.g. '$450k-$500k'. Use 'Unknown' if not stated."
     )
+    budget_max: int = Field(
+        description="Upper end of the budget as a whole number in the agency currency. 0 if unknown."
+    )
+    preferred_location: str = Field(description="Neighborhood or city the lead wants. 'Unknown' if not stated.")
+    lead_score: int = Field(description="Lead quality from 1 (cold) to 10 (ready to act now).")
+    score_reason: str = Field(description="One short sentence explaining the score.")
+    agent_summary: list[str] = Field(description="Exactly two short bullet points for the human agent.")
+    email_subject: str = Field(description="Subject line for the instant reply email.")
+    email_body: str = Field(
+        description="Plain-text email body starting with a greeting. No sign-off. Paragraphs separated by blank lines."
+    )
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def _normalise_intent(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return v.strip().title()
+        return v
+
+    @field_validator("lead_score", mode="before")
+    @classmethod
+    def _clamp_score(cls, v: Any) -> int:
+        try:
+            return max(1, min(10, int(round(float(v)))))
+        except (TypeError, ValueError):
+            return 5
+
+    @field_validator("budget_max", mode="before")
+    @classmethod
+    def _clean_budget(cls, v: Any) -> int:
+        try:
+            return max(0, int(float(v)))
+        except (TypeError, ValueError):
+            return 0
+
+    @field_validator("agent_summary", mode="before")
+    @classmethod
+    def _two_bullets(cls, v: Any) -> list[str]:
+        items = [v] if isinstance(v, str) else list(v or [])
+        items = [str(i).strip().lstrip("-• ").strip() for i in items if str(i).strip()]
+        while len(items) < 2:
+            items.append("No further detail provided.")
+        return items[:2]
